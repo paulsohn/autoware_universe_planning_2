@@ -1,0 +1,109 @@
+name: mirror-awf-combined
+
+on:
+  schedule:
+    - cron: 0,30 * * * *
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mirror-awf-combined:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          path: this-repo
+
+      - name: Check out autoware_universe
+        uses: actions/checkout@v4
+        with:
+          repository: autowarefoundation/autoware_universe
+          ref: main
+          fetch-depth: 0 # preserve the entire history
+          path: universe
+
+      - name: Check out autoware_core
+        uses: actions/checkout@v4
+        with:
+          repository: autowarefoundation/autoware_core
+          ref: main
+          fetch-depth: 0 # preserve the entire history
+          path: core
+
+      - name: Install git-filter-repo
+        run: sudo apt-get update && sudo apt-get install -y git-filter-repo
+        shell: bash
+
+      - name: Filter autoware_universe history
+        working-directory: universe
+        run: |
+          echo "regex:#(\d+)==>autowarefoundation/autoware_universe#\1" > /tmp/replace-universe.txt
+          git filter-repo --path planning/ --path .github/ --path docs/ --path-regex '^[^/]*$' --replace-message /tmp/replace-universe.txt --force
+        shell: bash
+
+      - name: Filter autoware_core history
+        working-directory: core
+        run: |
+          echo "regex:#(\d+)==>autowarefoundation/autoware_core#\1" > /tmp/replace-core.txt
+          git filter-repo --path planning/ --path-rename planning/:core_planning/ --replace-message /tmp/replace-core.txt --force
+        shell: bash
+
+      - name: Build combined linear history
+        run: |
+          set -euo pipefail
+
+          git init -q combined
+          cd combined
+          git remote add universe ../universe
+          git remote add core ../core
+          git fetch -q universe
+          git fetch -q core
+
+          universe_tip=$(git rev-parse universe/main)
+          core_tip=$(git rev-parse core/main)
+
+          # --date-order interleaves the two unrelated histories by commit date
+          # while still keeping every commit's own parent(s) ahead of it
+          git rev-list --no-merges --date-order --reverse "$universe_tip" "$core_tip" > /tmp/order.txt
+          echo "$(wc -l < /tmp/order.txt) commits to replay"
+
+          current_tip=""
+          while read -r sha; do
+            if parent=$(git rev-parse --verify -q "${sha}^"); then
+              range="${parent}..${sha}"
+            else
+              range="${sha}"
+            fi
+            # strip any signature so every commit has exactly one message "data" block
+            git fast-export --signed-commits=strip --reference-excluded-parents "$range" \
+              | python3 "$GITHUB_WORKSPACE/this-repo/.github/scripts/splice_commit.py" "$current_tip" \
+              | git fast-import --quiet --force
+            current_tip=$(git rev-parse refs/heads/awf-latest-combined)
+          done < /tmp/order.txt
+
+          git log --oneline -5 awf-latest-combined
+        shell: bash
+
+      - name: Generate token
+        id: generate-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+
+      - name: Set git config
+        uses: autowarefoundation/autoware-github-actions/set-git-config@v1
+        with:
+          token: ${{ steps.generate-token.outputs.token }}
+
+      - name: Push to downstream
+        working-directory: combined
+        run: |
+          git remote add downstream https://github.com/${{ github.repository }}.git
+          git push downstream awf-latest-combined:awf-latest-combined
+        shell: bash
